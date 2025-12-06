@@ -1,0 +1,13 @@
+build-essential
+cmake
+pkg-config
+git
+libssl-dev
+libbz2-dev
+liblzma-dev
+libffi-dev
+libgomp1
+libsnappy-dev
+libc-ares-dev
+python3-dev
+cargo
