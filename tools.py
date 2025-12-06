@@ -1,130 +1,99 @@
-#module to extract text from the user uploaded document
+# file: tools.py
 import re
 from io import BytesIO
-from typing import Any, Dict, List
+from typing import List, Dict
 import docx2txt
-import streamlit as st
-from embeddings import OpenAIEmbeddings
-from langchain.chains.qa_with_sources import load_qa_with_sources_chain
-from langchain.docstore.document import Document
-from langchain.llms import OpenAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import VectorStore
-from langchain.vectorstores.faiss import FAISS
-from openai.error import AuthenticationError
-from prompts import STUFF_PROMPT
+import numpy as np
+import requests
 from pypdf import PdfReader
-# Let the user input their API key
-OPENAI_API_KEY = st.session_state.get("openai_api_key")
+import openai
+import streamlit as st
 
-if not OPENAI_API_KEY:
-    st.sidebar.warning("Please enter your OpenAI API key to continue.")
-    OPENAI_API_KEY = st.sidebar.text_input("🔑 Enter your OpenAI API key:", type="password")
-    if OPENAI_API_KEY:
-        st.session_state["openai_api_key"] = OPENAI_API_KEY
-
-
-@st.cache_data
-def parse_docx(file: BytesIO) -> str:
+def parse_docx(file: BytesIO) -> List[str]:
     text = docx2txt.process(file)
     text = re.sub(r"\n\s*\n", "\n\n", text)
-    return text
+    return [text]
 
-@st.cache_data
 def parse_pdf(file: BytesIO) -> List[str]:
     pdf = PdfReader(file)
     output = []
     for page in pdf.pages:
-        text = page.extract_text()
-        # Merge hyphenated words
+        text = page.extract_text() or ""
         text = re.sub(r"(\w+)-\n(\w+)", r"\1\2", text)
         text = re.sub(r"(?<!\n\s)\n(?!\s\n)", " ", text.strip())
         text = re.sub(r"\n\s*\n", "\n\n", text)
         output.append(text)
     return output
 
-@st.cache_data
-def parse_txt(file: BytesIO) -> str:
-    text = file.read().decode("utf-8")
+def parse_txt(file: BytesIO) -> List[str]:
+    raw = file.read()
+    try:
+        text = raw.decode("utf-8")
+    except Exception:
+        text = raw.decode("latin-1")
     text = re.sub(r"\n\s*\n", "\n\n", text)
-    return text
+    return [text]
 
-
-@st.cache_data
-def text_to_docs(text: str or List[str]) -> List[Document]:
-    if isinstance(text, str):
-        text = [text]
-    page_docs = [Document(page_content=page) for page in text]
-
-    # Adding page numbers as metadata
-    for i, doc in enumerate(page_docs):
-        doc.metadata["page"] = i + 1
-
-    # Splitting pages into chunks
-    doc_chunks = []
-
-    for doc in page_docs:
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
-            chunk_overlap=0,
-        )
-        chunks = text_splitter.split_text(doc.page_content)
-        for i, chunk in enumerate(chunks):
-            doc = Document(
-                page_content=chunk, metadata={"page": doc.metadata["page"], "chunk": i}
-            )
-            # Add sources a metadata
-            doc.metadata["source"] = f"{doc.metadata['page']}-{doc.metadata['chunk']}"
-            doc_chunks.append(doc)
-    return doc_chunks
-
-
-# @st.cache_data
-def embed_docs(docs: List[Document]) -> VectorStore:
-    """Embeds a list of Documents and returns a FAISS index"""
-
-    if not st.session_state.get("OPENAI_API_KEY"):
-        raise AuthenticationError("Invalid OpenAI key !")
-    else:
-        # Embed the chunks
-        embeddings = OpenAIEmbeddings(
-            openai_api_key=st.session_state.get("OPENAI_API_KEY")
-        )  # type: ignore
-        index = FAISS.from_documents(docs, embeddings)
-
-        return index
-
-#@st.cache_data
-def search_docs(index: VectorStore, query: str) -> List[Document]:
-    """Searches a FAISS index for similar chunks to the query
-    and returns a list of Documents."""
-
-    # Search for similar chunks
-    docs = index.similarity_search(query, k=5)
+def text_to_docs(texts: List[str]) -> List[Dict]:
+    docs = []
+    for i, page in enumerate(texts):
+        if not page:
+            continue
+        # split into chunks ~800 chars
+        start = 0
+        while start < len(page):
+            chunk = page[start : start + 800]
+            docs.append({"text": chunk, "meta": f"page-{i+1}-chunk-{start//800}"})
+            start += 800
     return docs
 
-#@st.cache_data
-def get_answer(docs: List[Document], query: str) -> Dict[str, Any]:
-    """Gets an answer to a question from a list of Documents."""
-    chain = load_qa_with_sources_chain(
-        OpenAI(
-            temperature=0, openai_api_key=st.session_state.get("OPENAI_API_KEY")
-        ),
-        chain_type="stuff",
-        prompt=STUFF_PROMPT,
-    )
-    answer = chain(
-        {"input_documents": docs, "question": query}, return_only_outputs=True
-    )
-    return answer
+def _get_openai_client(api_key: str):
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY missing")
+    openai.api_key = api_key
+    return openai
 
-#@st.cache_data
-def get_sources(answer: Dict[str, Any], docs: List[Document]) -> List[Document]:
-    """Gets the source documents for an answer."""
-    source_keys = [s for s in answer["output_text"].split("SOURCES: ")[-1].split(", ")]
-    source_docs = []
-    for doc in docs:
-        if doc.metadata["source"] in source_keys:
-            source_docs.append(doc)
-    return source_docs
+def _embed_texts(openai_client, texts: List[str]) -> List[List[float]]:
+    # uses OpenAI embeddings endpoint
+    res = openai_client.Embedding.create(input=texts, model="text-embedding-3-small")
+    return [r["embedding"] for r in res["data"]]
+
+def embed_docs(docs: List[Dict], api_key: str):
+    client = _get_openai_client(api_key)
+    texts = [d["text"] for d in docs]
+    embeddings = _embed_texts(client, texts)
+    # store vectors on the index (just a list)
+    index = {"docs": docs, "embeddings": np.array(embeddings)}
+    st.session_state["__last_index__"] = index
+    return index
+
+def search_docs(index, query: str, top_k: int = 3):
+    client = _get_openai_client(st.session_state.get("OPENAI_API_KEY") or "")
+    q_emb = _embed_texts(client, [query])[0]
+    vecs = index["embeddings"]
+    dots = np.dot(vecs, np.array(q_emb))
+    norms = np.linalg.norm(vecs, axis=1) * (np.linalg.norm(q_emb) + 1e-12)
+    sims = dots / norms
+    top_idx = list(np.argsort(-sims)[:top_k])
+    results = []
+    for i in top_idx:
+        results.append({"text": index["docs"][i]["text"], "meta": index["docs"][i]["meta"], "score": float(sims[i])})
+    return results
+
+def get_answer(sources: List[Dict], query: str, api_key: str) -> Dict:
+    client = _get_openai_client(api_key)
+    # Build context from sources (concatenate top 5)
+    context = "\n\n".join([f"[SOURCE: {s['meta']}]\n{s['text']}" for s in sources])
+    prompt = (
+        f"Use the following document excerpts as references. If you cannot answer, say 'I do not know'.\n\n"
+        f"QUESTION: {query}\n\nDOCUMENTS:\n{context}\n\nFINAL ANSWER:"
+    )
+    completion = client.ChatCompletion.create(
+        model="gpt-4o-mini",  # if not available for you, change to "gpt-4o" or "gpt-3.5-turbo"
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.0,
+        max_tokens=512,
+    )
+    text = completion["choices"][0]["message"]["content"].strip()
+    st.session_state["last_answer"] = text
+    return {"text": text}
