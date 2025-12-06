@@ -2,7 +2,6 @@ streamlit==1.29.0
 openai==0.27.8
 pypdf==3.5.0
 docx2txt==0.8
-numpy==1.25.2
 requests==2.31.0
 trycourier==4.4.0
 python-dotenv==1.0.0
